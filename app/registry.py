@@ -142,3 +142,55 @@ class DeviceRegistry:
     def get(self, device_id: str) -> Device:
         with self._lock:
             return self._require(device_id)
+
+    # -- backup / restore ------------------------------------------------
+    def snapshot(self) -> dict:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict:
+        return {"devices": [{
+            "device_id": d.device_id,
+            "status": d.status.value,
+            "registered_at": d.registered_at,
+            "firmware_version": d.firmware_version,
+            "credential": {
+                "secret_hash": d.credential.secret_hash,
+                "issued_at": d.credential.issued_at,
+                "expires_at": d.credential.expires_at,
+                "revoked": d.credential.revoked,
+            },
+        } for d in self._devices.values()]}
+
+    def _restore_locked(self, data: dict) -> None:
+        """Replace all state with `data`. ValueError on malformed payload."""
+        raw_devices = data.get("devices")
+        if not isinstance(raw_devices, list):
+            raise ValueError("registry.devices must be a list")
+        devices: dict[str, Device] = {}
+        for item in raw_devices:
+            try:
+                cred_data = item["credential"]
+                device = Device(
+                    device_id=item["device_id"],
+                    status=DeviceStatus(item["status"]),
+                    registered_at=float(item["registered_at"]),
+                    firmware_version=str(item["firmware_version"]),
+                    credential=Credential(
+                        secret_hash=str(cred_data["secret_hash"]),
+                        issued_at=float(cred_data["issued_at"]),
+                        expires_at=(None if cred_data["expires_at"] is None
+                                    else float(cred_data["expires_at"])),
+                        revoked=bool(cred_data["revoked"]),
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"malformed device entry: {exc}") from exc
+            if not isinstance(device.device_id, str) or not device.device_id:
+                raise ValueError("malformed device entry: empty device_id")
+            if device.device_id in devices:
+                raise ValueError(
+                    f"malformed registry snapshot: duplicate device "
+                    f"{device.device_id!r}")
+            devices[device.device_id] = device
+        self._devices = devices

@@ -100,9 +100,11 @@ class FirmwareOrchestrator:
             return
         data = [c.to_dict() for c in self._campaigns.values()]
         tmp = self._state_path + ".tmp"
+        import os
+        parent = os.path.dirname(os.path.abspath(self._state_path))
+        os.makedirs(parent, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
-        import os
         os.replace(tmp, self._state_path)
 
     def recover(self) -> None:
@@ -116,15 +118,69 @@ class FirmwareOrchestrator:
             self._campaigns = {c["campaign_id"]: Campaign.from_dict(c)
                                for c in data}
             for campaign in self._campaigns.values():
-                if campaign.status is CampaignStatus.RUNNING:
-                    # Was mid-dispatch when the process died: park it so an
-                    # operator can resume explicitly; never leave it stuck.
-                    campaign.status = CampaignStatus.PAUSED
-                for dev, state in campaign.device_states.items():
-                    if state is DeviceUpdateState.IN_PROGRESS:
-                        campaign.device_states[dev] = DeviceUpdateState.PENDING
-                campaign.updated_at = self._clock()
+                self._normalize_on_load(campaign)
             self._persist()
+
+    @staticmethod
+    def _normalize_on_load(campaign: Campaign) -> None:
+        """Rules shared by restart recovery and backup restore.
+
+        A package may have been taken while a campaign was mid-flight:
+        RUNNING is parked to PAUSED (operator resumes explicitly, never
+        stuck) and interrupted IN_PROGRESS devices return to PENDING so
+        the idempotent flasher can safely re-dispatch only the unfinished
+        part. Terminal states, SUCCEEDED and FAILED devices are untouched.
+        """
+        if campaign.status is CampaignStatus.RUNNING:
+            campaign.status = CampaignStatus.PAUSED
+        for dev, state in campaign.device_states.items():
+            if state is DeviceUpdateState.IN_PROGRESS:
+                campaign.device_states[dev] = DeviceUpdateState.PENDING
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict:
+        return {"campaigns": [c.to_dict()
+                              for c in self._campaigns.values()]}
+
+    def _restore_locked(self, data: dict, normalize: bool = True) -> None:
+        """Replace all campaign state with `data`.
+
+        ValueError on malformed payload. When normalize=True the same
+        crash-consistency rules as recover() are applied.
+        """
+        raw = data.get("campaigns")
+        if not isinstance(raw, list):
+            raise ValueError("campaigns must be a list")
+        campaigns: dict[str, Campaign] = {}
+        for item in raw:
+            try:
+                campaign = Campaign.from_dict(item)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"malformed campaign entry: {exc}") from exc
+            if campaign.campaign_id in campaigns:
+                raise ValueError(
+                    f"malformed campaign snapshot: duplicate id "
+                    f"{campaign.campaign_id!r}")
+            # internal coherence: state map / attempts must cover every target
+            for dev in campaign.device_ids:
+                if dev not in campaign.device_states:
+                    raise ValueError(
+                        f"campaign {campaign.campaign_id!r}: device {dev!r} "
+                        "missing device state")
+                campaign.attempts.setdefault(dev, 0)
+            extra = set(campaign.device_states) - set(campaign.device_ids)
+            if extra:
+                raise ValueError(
+                    f"campaign {campaign.campaign_id!r}: state for unknown "
+                    f"devices {sorted(extra)}")
+            if normalize:
+                self._normalize_on_load(campaign)
+            campaigns[campaign.campaign_id] = campaign
+        self._campaigns = campaigns
+        self._persist()
 
     # -- lifecycle -------------------------------------------------------
     def create_campaign(self, campaign_id: str, target_version: str,

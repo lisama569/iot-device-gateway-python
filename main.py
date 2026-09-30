@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
+from app.backup import BackupManager
 from app.fota import FirmwareOrchestrator
-from app.models import ErrorCode, GatewayError
+from app.models import BackupError, ErrorCode, GatewayError
 from app.registry import DeviceRegistry
 from app.simulator import SimulatedFlasher
 from app.telemetry import TelemetryStore
@@ -31,6 +32,7 @@ flasher = SimulatedFlasher()
 orchestrator = FirmwareOrchestrator(registry, flasher,
                                     max_retries=FOTA_MAX_RETRIES,
                                     state_path=FOTA_STATE_PATH)
+backups = BackupManager(registry, telemetry, orchestrator, flasher)
 
 app = FastAPI(title="IoT Device Gateway")
 
@@ -49,11 +51,29 @@ _ERROR_STATUS = {
     ErrorCode.VALIDATION_FAILED: 422,
 }
 
+_BACKUP_ERROR_STATUS = {
+    # bad package itself: unreadable / checksum / version / sections / payload
+    "backup_truncated": 422,
+    "backup_integrity_failed": 422,
+    "backup_format_unsupported": 422,
+    "backup_missing_section": 422,
+    "backup_payload_invalid": 422,
+    # package is fine but cannot be applied to this gateway
+    "backup_nonempty_target": 409,
+}
+
 
 @app.exception_handler(GatewayError)
 async def gateway_error_handler(request, exc: GatewayError):
     return JSONResponse(
         status_code=_ERROR_STATUS.get(exc.code, 400),
+        content={"detail": {"code": exc.code.value, "message": exc.message}})
+
+
+@app.exception_handler(BackupError)
+async def backup_error_handler(request: Request, exc: BackupError):
+    return JSONResponse(
+        status_code=_BACKUP_ERROR_STATUS.get(exc.code.value, 400),
         content={"detail": {"code": exc.code.value, "message": exc.message}})
 
 
@@ -187,3 +207,36 @@ def campaign_status(campaign_id: str):
 @app.get("/")
 def read_root():
     return {"service": "iot-device-gateway", "docs": "/docs"}
+
+
+# --- backup / restore (migration & disaster-recovery) ---------------------
+@app.post("/admin/backup/export")
+def export_backup():
+    """Online full backup; the service keeps running during the export."""
+    raw = backups.export_bytes()
+    return Response(
+        content=raw,
+        media_type="application/zip",
+        headers={"Content-Disposition":
+                 'attachment; filename="gateway-backup.zip"'})
+
+
+@app.post("/admin/backup/inspect")
+async def inspect_backup(request: Request):
+    """Validate an uploaded package without changing any live state."""
+    raw = await request.body()
+    return backups.inspect_package(raw)
+
+
+@app.post("/admin/backup/restore")
+async def restore_backup(request: Request,
+                         x_allow_overwrite: str | None = Header(default=None)):
+    """Restore onto a fresh gateway.
+
+    Refuses (409 backup_nonempty_target) when the target already holds state,
+    unless the X-Allow-Overwrite: true header is present. Any validation
+    failure leaves the current state untouched.
+    """
+    raw = await request.body()
+    allow = (x_allow_overwrite or "").strip().lower() in ("1", "true", "yes")
+    return backups.restore_bytes(raw, allow_overwrite=allow)

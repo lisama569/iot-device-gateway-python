@@ -44,6 +44,28 @@ class SimulatedFlasher:
                 raise RuntimeError(f"simulated flash failure on {device_id}")
             self._versions[device_id] = target_version
 
+    # -- backup / restore ------------------------------------------------
+    def snapshot(self) -> dict:
+        """Only the actually-installed versions are durable runtime state;
+        scripted failures and call logs are test scaffolding."""
+        with self._lock:
+            return {"installed_versions": dict(self._versions)}
+
+    def restore_locked(self, data: dict) -> None:
+        raw = data.get("installed_versions")
+        if not isinstance(raw, dict):
+            raise ValueError("flasher.installed_versions must be an object")
+        versions = {}
+        for device_id, version in raw.items():
+            if not isinstance(device_id, str) or not device_id:
+                raise ValueError("malformed installed version: bad device id")
+            if not isinstance(version, str) or not version:
+                raise ValueError("malformed installed version: bad version")
+            versions[device_id] = version
+        self._versions = versions
+        self._failures_left = {}
+        self._calls = []
+
 
 class TelemetryGenerator:
     """Builds deterministic message streams incl. reorder/duplicates/skew."""

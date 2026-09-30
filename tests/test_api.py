@@ -1,6 +1,11 @@
 """End-to-end tests through the FastAPI surface using simulated device traffic."""
+import io
+import json
+import zipfile
+
 from fastapi.testclient import TestClient
 
+import main
 from main import app, orchestrator, registry, telemetry
 
 client = TestClient(app)
@@ -63,3 +68,77 @@ def test_campaign_over_http():
     resp = client.get("/campaigns/nope")
     assert resp.status_code == 404
     assert resp.json()["detail"]["code"] == "task_not_found"
+
+
+# --- backup / restore over HTTP ------------------------------------------
+def test_backup_export_inspect_restore_over_http():
+    # build some real lifecycle/shadow state
+    client.post("/devices/register", json={"device_id": "bk-1", "secret": "k"})
+    client.post("/devices/register", json={"device_id": "bk-2", "secret": "k"})
+    client.post("/devices/bk-1/telemetry",
+                json={"message_id": "bm1", "seq": 1, "device_ts": 100.0,
+                      "payload": {"temp": 9}},
+                headers={"X-Device-Secret": "k"})
+    resp = client.post("/campaigns", json={
+        "campaign_id": "bk-c1", "target_version": "1.2.3",
+        "device_ids": ["bk-1", "bk-2"], "batch_size": 1})
+    assert resp.status_code == 200
+
+    exported = client.post("/admin/backup/export")
+    assert exported.status_code == 200
+    assert exported.headers["content-type"] == "application/zip"
+    raw = exported.content
+    print(f"[api-backup] package {len(raw)} bytes")
+
+    # inspect works on an already-populated gateway (no state change)
+    insp = client.post("/admin/backup/inspect", content=raw)
+    assert insp.status_code == 200, insp.text
+    body = insp.json()
+    print(f"[api-inspect] {body}")
+    assert body["devices"] >= 2 and body["campaigns"] >= 1
+
+    # restoring into the non-empty gateway is refused, state is untouched
+    refused = client.post("/admin/backup/restore", content=raw)
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "backup_nonempty_target"
+
+    # truncated / tampered packages are distinguished
+    assert (client.post("/admin/backup/inspect", content=raw[:20]).json()
+            ["detail"]["code"] == "backup_truncated")
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        manifest = json.loads(zf.read("manifest.json"))
+        payload = json.loads(zf.read("data.json"))
+    payload["registry"]["devices"][0]["credential"]["secret_hash"] = "f" * 64
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf2:
+        zf2.writestr("manifest.json", json.dumps(manifest))
+        zf2.writestr("data.json", json.dumps(payload))
+    tampered = client.post("/admin/backup/inspect", content=buf.getvalue())
+    assert tampered.json()["detail"]["code"] == "backup_integrity_failed"
+
+    # after wiping the in-process gateway, restore succeeds and everything is
+    # observable through the same HTTP surface as before
+    main.registry._devices.clear()
+    for attr in ("_shadows", "_versions", "_seen_ids",
+                 "_accepted_count", "_rejected"):
+        getattr(main.telemetry, attr).clear()
+    main.orchestrator._campaigns.clear()
+    main.flasher._versions.clear()
+
+    restored = client.post("/admin/backup/restore", content=raw)
+    assert restored.status_code == 200, restored.text
+    print(f"[api-restore] {restored.json()}")
+    # old credential still authenticates; shadow identical
+    ok = client.post("/devices/bk-1/telemetry",
+                     json={"message_id": "bm2", "seq": 2, "device_ts": 200.0,
+                           "payload": {"temp": 10}},
+                     headers={"X-Device-Secret": "k"})
+    assert ok.status_code == 200
+    shadow = client.get("/devices/bk-1/shadow").json()
+    assert shadow["shadow"] == {"temp": 10}
+    # unfinished campaign survives and can be driven to completion
+    st = client.get("/campaigns/bk-c1").json()
+    assert st["status"] == "pending"
+    final = client.post("/campaigns/bk-c1/run").json()
+    print(f"[api-restore-campaign] {final['status']} {final['device_states']}")
+    assert final["status"] == "completed"

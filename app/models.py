@@ -37,6 +37,25 @@ class GatewayError(Exception):
         self.message = message
 
 
+class BackupRejection(enum.Enum):
+    """Machine-distinguishable reasons a backup package is refused."""
+    TRUNCATED = "backup_truncated"                 # archive cut short / unreadable
+    INTEGRITY_FAILED = "backup_integrity_failed"   # checksum mismatch / tampered
+    FORMAT_UNSUPPORTED = "backup_format_unsupported"
+    MISSING_SECTION = "backup_missing_section"     # required info absent
+    PAYLOAD_INVALID = "backup_payload_invalid"     # present but unparseable
+    NONEMPTY_TARGET = "backup_nonempty_target"     # restore only into fresh state
+
+
+class BackupError(Exception):
+    """Raised when a backup package cannot be produced or safely imported."""
+
+    def __init__(self, code: BackupRejection, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class CampaignStatus(enum.Enum):
     PENDING = "pending"
     RUNNING = "running"
