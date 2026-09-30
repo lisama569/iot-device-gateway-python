@@ -99,10 +99,12 @@ class FirmwareOrchestrator:
         if not self._state_path:
             return
         data = [c.to_dict() for c in self._campaigns.values()]
+        import os
+        directory = os.path.dirname(os.path.abspath(self._state_path))
+        os.makedirs(directory, exist_ok=True)
         tmp = self._state_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
-        import os
         os.replace(tmp, self._state_path)
 
     def recover(self) -> None:
@@ -304,3 +306,32 @@ class FirmwareOrchestrator:
     def list_campaigns(self) -> list[dict]:
         with self._lock:
             return [c.to_dict() for c in self._campaigns.values()]
+
+    # -- backup/restore (caller holds self._lock) ------------------------
+    def snapshot_locked(self) -> dict:
+        return {"campaigns": [c.to_dict()
+                              for c in self._campaigns.values()]}
+
+    def restore_locked(self, data: dict) -> dict:
+        """Replace campaign state from validated backup data.
+
+        Normalization matches restart recovery: a campaign captured while
+        RUNNING comes back PAUSED (never stuck), and an IN_PROGRESS device
+        goes back to PENDING so it is re-dispatched at most (flasher is
+        idempotent, so already-succeeded devices are never re-delivered).
+        """
+        campaigns: dict[str, Campaign] = {}
+        for raw in data["campaigns"]:
+            campaign = Campaign.from_dict(raw)
+            if campaign.campaign_id in campaigns:
+                raise ValueError(
+                    f"duplicate campaign {campaign.campaign_id!r}")
+            if campaign.status is CampaignStatus.RUNNING:
+                campaign.status = CampaignStatus.PAUSED
+            for dev, state in campaign.device_states.items():
+                if state is DeviceUpdateState.IN_PROGRESS:
+                    campaign.device_states[dev] = DeviceUpdateState.PENDING
+            campaigns[campaign.campaign_id] = campaign
+        self._campaigns = campaigns
+        self._persist()
+        return {"campaigns": len(campaigns)}

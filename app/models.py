@@ -26,6 +26,10 @@ class ErrorCode(enum.Enum):
     TASK_NOT_FOUND = "task_not_found"
     TASK_STATE_CONFLICT = "task_state_conflict"
     DEVICE_BUSY = "device_busy"
+    BACKUP_CORRUPTED = "backup_corrupted"
+    BACKUP_INTEGRITY_FAILED = "backup_integrity_failed"
+    BACKUP_VERSION_UNSUPPORTED = "backup_version_unsupported"
+    BACKUP_INCOMPLETE = "backup_incomplete"
 
 
 class GatewayError(Exception):

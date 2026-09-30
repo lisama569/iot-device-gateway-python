@@ -8,17 +8,22 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import threading
 
 
 class SimulatedFlasher:
     """Idempotent firmware applier with scriptable failures."""
 
-    def __init__(self):
+    def __init__(self, state_path: str | None = None):
         self._versions: dict[str, str] = {}
         self._failures_left: dict[str, int] = {}
         self._calls: list[tuple[str, str]] = []
         self._lock = threading.Lock()
+        self._state_path = state_path
+        if state_path:
+            self.recover()
 
     def fail_next(self, device_id: str, times: int) -> None:
         """Script the next `times` flash attempts of a device to fail."""
@@ -43,6 +48,49 @@ class SimulatedFlasher:
                 self._failures_left[device_id] = left - 1
                 raise RuntimeError(f"simulated flash failure on {device_id}")
             self._versions[device_id] = target_version
+            self._persist_locked()
+
+    # -- backup/restore (caller holds self._lock) ------------------------
+    def snapshot_locked(self) -> dict:
+        """Actual installed version per device (the device-side ground truth).
+
+        Scripted failures and call logs are transient test scaffolding and are
+        intentionally not backed up.
+        """
+        return {"versions": dict(self._versions)}
+
+    def restore_locked(self, data: dict) -> int:
+        versions: dict[str, str] = {}
+        for dev, ver in data["versions"].items():
+            if not isinstance(dev, str) or not dev:
+                raise ValueError("flasher device id must be a non-empty string")
+            if not isinstance(ver, str) or not ver:
+                raise ValueError(f"flasher version for {dev!r} must be a string")
+            versions[dev] = ver
+        self._versions = versions
+        self._failures_left = {}  # transient state starts clean after restore
+        self._calls = []
+        self._persist_locked()
+        return len(versions)
+
+    # -- persistence ------------------------------------------------------
+    def _persist_locked(self) -> None:
+        if not self._state_path:
+            return
+        directory = os.path.dirname(os.path.abspath(self._state_path))
+        os.makedirs(directory, exist_ok=True)
+        tmp = self._state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.snapshot_locked(), fh, indent=2)
+        os.replace(tmp, self._state_path)
+
+    def recover(self) -> None:
+        if not self._state_path or not os.path.exists(self._state_path):
+            return
+        with open(self._state_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        with self._lock:
+            self.restore_locked(data)
 
 
 class TelemetryGenerator:

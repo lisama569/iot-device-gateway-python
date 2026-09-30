@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
+from app.backup import BackupCoordinator
 from app.fota import FirmwareOrchestrator
 from app.models import ErrorCode, GatewayError
 from app.registry import DeviceRegistry
@@ -22,15 +23,31 @@ CREDENTIAL_TTL_SECONDS = float(os.getenv("GATEWAY_CREDENTIAL_TTL_SECONDS", "3600
 TELEMETRY_QUOTA = int(os.getenv("GATEWAY_TELEMETRY_QUOTA", "1000"))
 MAX_CLOCK_SKEW_SECONDS = float(os.getenv("GATEWAY_MAX_CLOCK_SKEW_SECONDS", "300"))
 FOTA_MAX_RETRIES = int(os.getenv("GATEWAY_FOTA_MAX_RETRIES", "2"))
-FOTA_STATE_PATH = os.getenv("GATEWAY_FOTA_STATE_PATH") or None
+# State directory: when set, registry / telemetry / campaigns are each
+# persisted as an atomic JSON file and auto-recovered on the next start, so a
+# restored deployment also survives ordinary process restarts.
+STATE_DIR = os.getenv("GATEWAY_STATE_DIR") or None
+if STATE_DIR:
+    os.makedirs(STATE_DIR, exist_ok=True)
+FOTA_STATE_PATH = os.getenv("GATEWAY_FOTA_STATE_PATH") or (
+    os.path.join(STATE_DIR, "fota.json") if STATE_DIR else None)
+REGISTRY_STATE_PATH = (os.path.join(STATE_DIR, "registry.json")
+                       if STATE_DIR else None)
+TELEMETRY_STATE_PATH = (os.path.join(STATE_DIR, "telemetry.json")
+                        if STATE_DIR else None)
+FLASHER_STATE_PATH = (os.path.join(STATE_DIR, "devices.json")
+                      if STATE_DIR else None)
 
-registry = DeviceRegistry(credential_ttl_seconds=CREDENTIAL_TTL_SECONDS)
+registry = DeviceRegistry(credential_ttl_seconds=CREDENTIAL_TTL_SECONDS,
+                          state_path=REGISTRY_STATE_PATH)
 telemetry = TelemetryStore(per_device_quota=TELEMETRY_QUOTA,
-                           max_clock_skew_seconds=MAX_CLOCK_SKEW_SECONDS)
-flasher = SimulatedFlasher()
+                           max_clock_skew_seconds=MAX_CLOCK_SKEW_SECONDS,
+                           state_path=TELEMETRY_STATE_PATH)
+flasher = SimulatedFlasher(state_path=FLASHER_STATE_PATH)
 orchestrator = FirmwareOrchestrator(registry, flasher,
                                     max_retries=FOTA_MAX_RETRIES,
                                     state_path=FOTA_STATE_PATH)
+backups = BackupCoordinator(registry, telemetry, orchestrator, flasher)
 
 app = FastAPI(title="IoT Device Gateway")
 
@@ -47,6 +64,10 @@ _ERROR_STATUS = {
     ErrorCode.CREDENTIAL_REVOKED: 401,
     ErrorCode.QUOTA_EXCEEDED: 429,
     ErrorCode.VALIDATION_FAILED: 422,
+    ErrorCode.BACKUP_CORRUPTED: 400,
+    ErrorCode.BACKUP_INTEGRITY_FAILED: 422,
+    ErrorCode.BACKUP_VERSION_UNSUPPORTED: 422,
+    ErrorCode.BACKUP_INCOMPLETE: 422,
 }
 
 
@@ -182,6 +203,41 @@ def cancel_campaign(campaign_id: str):
 @app.get("/campaigns/{campaign_id}")
 def campaign_status(campaign_id: str):
     return orchestrator.status(campaign_id)
+
+
+# --- backup & restore ------------------------------------------------------
+class RestorePathBody(BaseModel):
+    path: str
+
+
+@app.post("/admin/backup")
+def export_backup(body: RestorePathBody | None = None):
+    """Online full-state export; service keeps running.
+
+    With a JSON body {"path": "..."} the backup is atomically written there;
+    without a body it is streamed back as the response (Content-Disposition).
+    """
+    if body is not None and body.path:
+        result = backups.export_to_file(body.path)
+        return {"exported": True, **result}
+    raw = backups.export_bytes()
+    return Response(
+        content=raw, media_type="application/json",
+        headers={"Content-Disposition":
+                 'attachment; filename="gateway-backup.json"'})
+
+
+@app.post("/admin/restore")
+async def restore_backup(request: Request):
+    """Validate then apply an uploaded backup; failed imports change nothing."""
+    raw = await request.body()
+    return {"restored": True, **backups.restore_bytes(raw)}
+
+
+@app.post("/admin/restore-file")
+def restore_backup_file(body: RestorePathBody):
+    """Validate then apply a backup from a local path (migration on one box)."""
+    return {"restored": True, **backups.restore_from_file(body.path)}
 
 
 @app.get("/")

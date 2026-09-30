@@ -1,4 +1,6 @@
 """End-to-end tests through the FastAPI surface using simulated device traffic."""
+import json
+
 from fastapi.testclient import TestClient
 
 from main import app, orchestrator, registry, telemetry
@@ -63,3 +65,45 @@ def test_campaign_over_http():
     resp = client.get("/campaigns/nope")
     assert resp.status_code == 404
     assert resp.json()["detail"]["code"] == "task_not_found"
+
+
+def test_backup_restore_over_http():
+    # self-contained: register a fresh device inside this test
+    r = client.post("/devices/register", json={"device_id": "bk-api",
+                                               "secret": "bk-pw"})
+    assert r.status_code == 200
+    client.post("/devices/bk-api/telemetry",
+                json={"message_id": "bk-m", "seq": 1, "device_ts": 7000.0,
+                      "payload": {"z": 3}},
+                headers={"X-Device-Secret": "bk-pw"})
+
+    # online export (streamed), then re-import the same package: state stable
+    raw = client.post("/admin/backup").content
+    envelope = json.loads(raw)
+    assert envelope["format"] == "iot-gateway-backup"
+    assert envelope["format_version"] == 1
+
+    resp = client.post(
+        "/admin/restore", content=raw,
+        headers={"Content-Type": "application/json"})
+    assert resp.status_code == 200
+    assert resp.json()["restored"] is True
+
+    # a second identical import yields the same observable state
+    shadow_before = client.get("/devices/bk-api/shadow").json()
+    client.post("/admin/restore", content=raw,
+                headers={"Content-Type": "application/json"})
+    assert client.get("/devices/bk-api/shadow").json() == shadow_before
+
+    # tampered package (payload changed without re-sealing) -> integrity fail
+    devices = envelope["payload"]["registry"]["devices"]
+    target = next(d for d in devices if d["device_id"] == "bk-api")
+    target["status"] = "disabled"
+    tampered = json.dumps(envelope).encode()
+    bad = client.post("/admin/restore", content=tampered,
+                      headers={"Content-Type": "application/json"})
+    assert bad.status_code == 422
+    assert bad.json()["detail"]["code"] == "backup_integrity_failed"
+    # failed import must not change the current usable state
+    assert client.get("/devices/bk-api/shadow").json() == shadow_before
+    assert shadow_before["shadow"] == {"z": 3}
