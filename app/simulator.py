@@ -19,6 +19,14 @@ class SimulatedFlasher:
         self._failures_left: dict[str, int] = {}
         self._calls: list[tuple[str, str]] = []
         self._lock = threading.Lock()
+        # Optional change observer (restart persistence); always invoked
+        # after the lock has been released, never while holding it.
+        self._observer = None
+
+    def _notify_change(self) -> None:
+        observer = self._observer
+        if observer is not None:
+            observer()
 
     def fail_next(self, device_id: str, times: int) -> None:
         """Script the next `times` flash attempts of a device to fail."""
@@ -34,6 +42,7 @@ class SimulatedFlasher:
             return list(self._calls)
 
     def __call__(self, device_id: str, target_version: str) -> None:
+        changed = False
         with self._lock:
             self._calls.append((device_id, target_version))
             if self._versions.get(device_id) == target_version:
@@ -43,6 +52,9 @@ class SimulatedFlasher:
                 self._failures_left[device_id] = left - 1
                 raise RuntimeError(f"simulated flash failure on {device_id}")
             self._versions[device_id] = target_version
+            changed = True
+        if changed:
+            self._notify_change()
 
     # -- backup / restore ------------------------------------------------
     def snapshot(self) -> dict:

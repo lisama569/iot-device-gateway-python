@@ -60,6 +60,14 @@ class TelemetryStore:
         self._accepted_count: dict[str, int] = {}
         self._rejected: dict[str, list[IngestResult]] = {}
         self._lock = threading.Lock()
+        # Optional change observer (restart persistence); always invoked
+        # after the lock has been released, never while holding it.
+        self._observer = None
+
+    def _notify_change(self) -> None:
+        observer = self._observer
+        if observer is not None:
+            observer()
 
     # -- helpers ---------------------------------------------------------
     def _reject(self, device_id: str, code: ErrorCode) -> IngestResult:
@@ -92,41 +100,52 @@ class TelemetryStore:
         with self._lock:
             invalid = self._validate(device_id, message_id, seq, device_ts, payload)
             if invalid is not None:
-                return invalid
+                result, changed = invalid, True  # rejection was recorded
+            else:
+                result, changed = self._ingest_valid_locked(
+                    device_id, message_id, seq, device_ts, payload)
+        if changed:
+            self._notify_change()
+        return result
 
-            seen = self._seen_ids.setdefault(device_id, set())
-            if message_id in seen:
-                # Idempotent replay: success, no state change, no quota spent.
-                return IngestResult(accepted=True,
-                                    code=ErrorCode.DUPLICATE_MESSAGE.value)
+    def _ingest_valid_locked(self, device_id: str, message_id: str, seq: int,
+                             device_ts: float, payload: dict,
+                             ) -> tuple[IngestResult, bool]:
+        """Handle a validated message. Returns (result, state_changed)."""
+        seen = self._seen_ids.setdefault(device_id, set())
+        if message_id in seen:
+            # Idempotent replay: success, no state change, no quota spent.
+            return (IngestResult(accepted=True,
+                                 code=ErrorCode.DUPLICATE_MESSAGE.value),
+                    False)
 
-            count = self._accepted_count.get(device_id, 0)
-            if count >= self._quota:
-                return self._reject(device_id, ErrorCode.QUOTA_EXCEEDED)
+        count = self._accepted_count.get(device_id, 0)
+        if count >= self._quota:
+            return self._reject(device_id, ErrorCode.QUOTA_EXCEEDED), True
 
-            seen.add(message_id)
-            self._accepted_count[device_id] = count + 1
+        seen.add(message_id)
+        self._accepted_count[device_id] = count + 1
 
-            shadow = self._shadows.setdefault(device_id, {})
-            versions = self._versions.setdefault(device_id, {})
-            incoming = FieldVersion(device_ts=device_ts, seq=seq)
-            decisions: list[MergeDecision] = []
-            for key, value in payload.items():
-                stored = versions.get(key)
-                if stored is None or incoming.as_tuple() > stored.as_tuple():
-                    shadow[key] = value
-                    versions[key] = incoming
-                    decisions.append(MergeDecision(
-                        field=key, outcome="applied",
-                        reason=(f"incoming (ts={device_ts}, seq={seq}) > stored "
-                                f"{stored.as_tuple() if stored else None}")))
-                else:
-                    decisions.append(MergeDecision(
-                        field=key, outcome="stale_rejected",
-                        reason=(f"incoming (ts={device_ts}, seq={seq}) <= stored "
-                                f"{stored.as_tuple()}; kept "
-                                f"{shadow[key]!r}")))
-            return IngestResult(accepted=True, code="ok", decisions=decisions)
+        shadow = self._shadows.setdefault(device_id, {})
+        versions = self._versions.setdefault(device_id, {})
+        incoming = FieldVersion(device_ts=device_ts, seq=seq)
+        decisions: list[MergeDecision] = []
+        for key, value in payload.items():
+            stored = versions.get(key)
+            if stored is None or incoming.as_tuple() > stored.as_tuple():
+                shadow[key] = value
+                versions[key] = incoming
+                decisions.append(MergeDecision(
+                    field=key, outcome="applied",
+                    reason=(f"incoming (ts={device_ts}, seq={seq}) > stored "
+                            f"{stored.as_tuple() if stored else None}")))
+            else:
+                decisions.append(MergeDecision(
+                    field=key, outcome="stale_rejected",
+                    reason=(f"incoming (ts={device_ts}, seq={seq}) <= stored "
+                            f"{stored.as_tuple()}; kept "
+                            f"{shadow[key]!r}")))
+        return IngestResult(accepted=True, code="ok", decisions=decisions), True
 
     def shadow(self, device_id: str) -> dict:
         with self._lock:

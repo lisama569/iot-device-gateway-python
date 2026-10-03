@@ -1,10 +1,16 @@
 """FastAPI wiring for the IoT device gateway.
 
-All state is in-memory (optionally JSON-persisted for FOTA campaigns); no
-external broker, real devices, or real credentials are involved.
+State durability: when GATEWAY_STATE_PATH is set, the whole gateway state
+(registry, telemetry, FOTA campaigns, installed firmware versions) is
+checkpointed to that file after every mutation and reloaded on boot, so a
+restored gateway keeps working across restarts/redeploys. Otherwise all
+state is in-memory (FOTA campaigns may still be JSON-persisted separately
+via GATEWAY_FOTA_STATE_PATH). No external broker, real devices, or real
+credentials are involved.
 """
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -14,16 +20,22 @@ from pydantic import BaseModel, Field
 from app.backup import BackupManager
 from app.fota import FirmwareOrchestrator
 from app.models import BackupError, ErrorCode, GatewayError
+from app.persistence import StateStore
 from app.registry import DeviceRegistry
 from app.simulator import SimulatedFlasher
 from app.telemetry import TelemetryStore
+
+logger = logging.getLogger("iot-gateway")
 
 # --- configuration (env-overridable) -------------------------------------
 CREDENTIAL_TTL_SECONDS = float(os.getenv("GATEWAY_CREDENTIAL_TTL_SECONDS", "3600"))
 TELEMETRY_QUOTA = int(os.getenv("GATEWAY_TELEMETRY_QUOTA", "1000"))
 MAX_CLOCK_SKEW_SECONDS = float(os.getenv("GATEWAY_MAX_CLOCK_SKEW_SECONDS", "300"))
 FOTA_MAX_RETRIES = int(os.getenv("GATEWAY_FOTA_MAX_RETRIES", "2"))
-FOTA_STATE_PATH = os.getenv("GATEWAY_FOTA_STATE_PATH") or None
+GATEWAY_STATE_PATH = os.getenv("GATEWAY_STATE_PATH") or None
+# the unified state file supersedes the FOTA-only state file
+FOTA_STATE_PATH = (None if GATEWAY_STATE_PATH
+                   else os.getenv("GATEWAY_FOTA_STATE_PATH") or None)
 
 registry = DeviceRegistry(credential_ttl_seconds=CREDENTIAL_TTL_SECONDS)
 telemetry = TelemetryStore(per_device_quota=TELEMETRY_QUOTA,
@@ -33,6 +45,15 @@ orchestrator = FirmwareOrchestrator(registry, flasher,
                                     max_retries=FOTA_MAX_RETRIES,
                                     state_path=FOTA_STATE_PATH)
 backups = BackupManager(registry, telemetry, orchestrator, flasher)
+
+state_store: StateStore | None = None
+if GATEWAY_STATE_PATH:
+    state_store = StateStore(backups, GATEWAY_STATE_PATH).attach()
+    if state_store.load() == "error":
+        logger.error("gateway state checkpoint rejected: %s (quarantined to "
+                     "%s); starting empty, backup import still available",
+                     state_store.status()["last_error"],
+                     state_store.status()["quarantined_to"])
 
 app = FastAPI(title="IoT Device Gateway")
 
@@ -240,3 +261,13 @@ async def restore_backup(request: Request,
     raw = await request.body()
     allow = (x_allow_overwrite or "").strip().lower() in ("1", "true", "yes")
     return backups.restore_bytes(raw, allow_overwrite=allow)
+
+
+@app.get("/admin/state")
+def state_persistence_status():
+    """Restart-persistence health: whether the boot checkpoint was loaded,
+    or the explicit reason it was rejected (and where it was quarantined)."""
+    if state_store is None:
+        return {"enabled": False,
+                "hint": "set GATEWAY_STATE_PATH to survive restarts"}
+    return state_store.status()

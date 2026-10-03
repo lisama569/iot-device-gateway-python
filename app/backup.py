@@ -53,6 +53,14 @@ class BackupManager:
         self._orchestrator = orchestrator
         self._flasher = flasher
         self._clock = clock
+        # Optional change observer (restart persistence), notified after a
+        # successful restore once every lock has been released.
+        self._observer = None
+
+    def _notify_change(self) -> None:
+        observer = self._observer
+        if observer is not None:
+            observer()
 
     # -- locking ---------------------------------------------------------
     @contextlib.contextmanager
@@ -339,6 +347,9 @@ class BackupManager:
                     "state; start from a clean data directory or pass "
                     "allow_overwrite=True")
             self._swap_locked(staged)
+        # locks released: the restored state is live; make it durable so a
+        # restart from here keeps everything the restore just brought in
+        self._notify_change()
         return staged["summary"]
 
     def restore_from_path(self, path: str, *,

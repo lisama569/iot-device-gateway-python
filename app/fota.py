@@ -91,8 +91,17 @@ class FirmwareOrchestrator:
         self._clock = clock
         self._campaigns: dict[str, Campaign] = {}
         self._lock = threading.RLock()
+        # Optional change observer (restart persistence); always invoked
+        # after the orchestrator lock has been released, never while
+        # holding it, so snapshotting from the observer cannot deadlock.
+        self._observer = None
         if state_path:
             self.recover()
+
+    def _notify_change(self) -> None:
+        observer = self._observer
+        if observer is not None:
+            observer()
 
     # -- persistence -----------------------------------------------------
     def _persist(self) -> None:
@@ -120,6 +129,7 @@ class FirmwareOrchestrator:
             for campaign in self._campaigns.values():
                 self._normalize_on_load(campaign)
             self._persist()
+        self._notify_change()
 
     @staticmethod
     def _normalize_on_load(campaign: Campaign) -> None:
@@ -218,7 +228,9 @@ class FirmwareOrchestrator:
             )
             self._campaigns[campaign_id] = campaign
             self._persist()
-            return campaign.to_dict()
+            result = campaign.to_dict()
+        self._notify_change()
+        return result
 
     def _check_device_free(self, device_id: str) -> None:
         for other in self._campaigns.values():
@@ -247,6 +259,13 @@ class FirmwareOrchestrator:
     # -- execution -------------------------------------------------------
     def run_until_blocked(self, campaign_id: str) -> dict:
         """Dispatch batches until the campaign is paused, cancelled, or terminal."""
+        try:
+            return self._run_until_blocked(campaign_id)
+        finally:
+            # one last durability checkpoint with the lock fully released
+            self._notify_change()
+
+    def _run_until_blocked(self, campaign_id: str) -> dict:
         with self._lock:
             campaign = self._require(campaign_id)
             if campaign.status is CampaignStatus.PENDING:
@@ -317,6 +336,9 @@ class FirmwareOrchestrator:
                     failed.add(dev)
                 campaign.updated_at = self._clock()
                 self._persist()
+            # durability checkpoint per device, outside the lock: a restart
+            # here must still know exactly which devices already succeeded
+            self._notify_change()
         return failed
 
     # -- control ---------------------------------------------------------
@@ -328,7 +350,9 @@ class FirmwareOrchestrator:
                 campaign.status = CampaignStatus.PAUSED
                 campaign.updated_at = self._clock()
                 self._persist()
-            return campaign.to_dict()
+            result = campaign.to_dict()
+        self._notify_change()
+        return result
 
     def resume(self, campaign_id: str) -> dict:
         with self._lock:
@@ -351,7 +375,9 @@ class FirmwareOrchestrator:
                     campaign.device_states[dev] = DeviceUpdateState.SKIPPED
             campaign.updated_at = self._clock()
             self._persist()
-            return campaign.to_dict()
+            result = campaign.to_dict()
+        self._notify_change()
+        return result
 
     def status(self, campaign_id: str) -> dict:
         with self._lock:

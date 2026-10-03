@@ -46,6 +46,16 @@ class DeviceRegistry:
         self._clock = clock
         self._devices: dict[str, Device] = {}
         self._lock = threading.Lock()
+        # Optional change observer (used by restart persistence). It is
+        # always invoked AFTER the component lock has been released, so an
+        # observer that re-enters the gateway (e.g. takes a snapshot under
+        # the global lock order) can never deadlock.
+        self._observer = None
+
+    def _notify_change(self) -> None:
+        observer = self._observer
+        if observer is not None:
+            observer()
 
     def register(self, device_id: str, secret: str) -> Device:
         if not device_id or not secret:
@@ -55,7 +65,7 @@ class DeviceRegistry:
             existing = self._devices.get(device_id)
             if existing is not None and existing.status is not DeviceStatus.DEREGISTERED:
                 if existing.credential.secret_hash == _hash_secret(secret):
-                    return existing  # idempotent replay
+                    return existing  # idempotent replay: no state change
                 raise GatewayError(ErrorCode.DEVICE_ID_CONFLICT,
                                    f"device_id {device_id!r} already registered "
                                    "with different credential")
@@ -70,7 +80,8 @@ class DeviceRegistry:
                             firmware_version=(existing.firmware_version
                                               if existing else "0.0.0"))
             self._devices[device_id] = device
-            return device
+        self._notify_change()
+        return device
 
     def authenticate(self, device_id: str, secret: str) -> Device:
         with self._lock:
@@ -104,26 +115,30 @@ class DeviceRegistry:
         with self._lock:
             device = self._require(device_id)
             device.status = DeviceStatus.DISABLED
-            return device
+        self._notify_change()
+        return device
 
     def enable(self, device_id: str) -> Device:
         with self._lock:
             device = self._require(device_id)
             device.status = DeviceStatus.ACTIVE
-            return device
+        self._notify_change()
+        return device
 
     def deregister(self, device_id: str) -> Device:
         with self._lock:
             device = self._require(device_id)
             device.status = DeviceStatus.DEREGISTERED
             device.credential.revoked = True
-            return device
+        self._notify_change()
+        return device
 
     def revoke_credential(self, device_id: str) -> Device:
         with self._lock:
             device = self._require(device_id)
             device.credential.revoked = True
-            return device
+        self._notify_change()
+        return device
 
     def rotate_credential(self, device_id: str, new_secret: str) -> Device:
         if not new_secret:
@@ -137,7 +152,8 @@ class DeviceRegistry:
                 issued_at=now,
                 expires_at=None if self._ttl is None else now + self._ttl,
             )
-            return device
+        self._notify_change()
+        return device
 
     def get(self, device_id: str) -> Device:
         with self._lock:
