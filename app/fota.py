@@ -83,16 +83,30 @@ class Campaign:
 class FirmwareOrchestrator:
     def __init__(self, registry: DeviceRegistry, flasher: Flasher,
                  max_retries: int = 2, state_path: str | None = None,
-                 clock=time.time):
+                 clock=time.time, on_change=None):
         self._registry = registry
         self._flasher = flasher
         self._max_retries = max_retries
         self._state_path = state_path
         self._clock = clock
+        self._on_change = on_change
         self._campaigns: dict[str, Campaign] = {}
         self._lock = threading.RLock()
         if state_path:
             self.recover()
+
+    def _notify(self) -> None:
+        """Durability hook; always called with NO component lock held.
+
+        Flashing has physical side effects that cannot be undone, and the
+        durable snapshot already contains everything up to the last per-
+        device success -- so if flushing fails we do not roll campaign
+        memory back (it still matches the flasher/registry); instead the
+        error propagates to the caller and DurableState faults, gating all
+        business calls until an admin restore.
+        """
+        if self._on_change is not None:
+            self._on_change()
 
     # -- persistence -----------------------------------------------------
     def _persist(self) -> None:
@@ -218,7 +232,8 @@ class FirmwareOrchestrator:
             )
             self._campaigns[campaign_id] = campaign
             self._persist()
-            return campaign.to_dict()
+        self._notify()
+        return campaign.to_dict()
 
     def _check_device_free(self, device_id: str) -> None:
         for other in self._campaigns.values():
@@ -253,12 +268,13 @@ class FirmwareOrchestrator:
                 campaign.status = CampaignStatus.RUNNING
                 campaign.updated_at = self._clock()
                 self._persist()
-            if campaign.status is not CampaignStatus.RUNNING:
+            elif campaign.status is not CampaignStatus.RUNNING:
                 if campaign.status in TERMINAL_STATES:
                     return campaign.to_dict()
                 raise GatewayError(ErrorCode.TASK_STATE_CONFLICT,
                                    f"campaign is {campaign.status.value}; "
                                    "resume it first")
+        self._notify()  # PENDING -> RUNNING is now durable before dispatching
         while True:
             with self._lock:
                 if campaign.status is not CampaignStatus.RUNNING:
@@ -268,14 +284,19 @@ class FirmwareOrchestrator:
                     campaign.status = CampaignStatus.COMPLETED
                     campaign.updated_at = self._clock()
                     self._persist()
-                    return campaign.to_dict()
+                    done = campaign.to_dict()
+            if campaign.status is CampaignStatus.COMPLETED:
+                self._notify()
+                return done
+            with self._lock:
                 batch = batches[campaign.current_batch]
                 for dev in batch:
                     if campaign.device_states[dev] is DeviceUpdateState.PENDING:
                         campaign.device_states[dev] = DeviceUpdateState.IN_PROGRESS
                 campaign.updated_at = self._clock()
                 self._persist()
-            failed = self._run_batch(campaign, batch)
+            self._notify()  # IN_PROGRESS dispatch markers are durable
+            failed = self._run_batch(campaign, batch)  # notifies per device
             with self._lock:
                 campaign.current_batch += 1
                 if failed:
@@ -287,8 +308,10 @@ class FirmwareOrchestrator:
                             campaign.device_states[dev] = DeviceUpdateState.SKIPPED
                 campaign.updated_at = self._clock()
                 self._persist()
-                if failed:
-                    return campaign.to_dict()
+                result = campaign.to_dict()
+            self._notify()  # batch boundary (and FAILED terminalization)
+            if failed:
+                return result
 
     def _run_batch(self, campaign: Campaign, batch: list[str]) -> set[str]:
         """Flash one batch (flasher called outside the lock). Returns failures."""
@@ -317,6 +340,10 @@ class FirmwareOrchestrator:
                     failed.add(dev)
                 campaign.updated_at = self._clock()
                 self._persist()
+            # Per-device durability: a succeeded device (flasher version +
+            # registry bookkeeping + campaign state) is on disk before the
+            # next device starts, so a crash never re-dispatches it.
+            self._notify()
         return failed
 
     # -- control ---------------------------------------------------------
@@ -328,7 +355,9 @@ class FirmwareOrchestrator:
                 campaign.status = CampaignStatus.PAUSED
                 campaign.updated_at = self._clock()
                 self._persist()
-            return campaign.to_dict()
+            result = campaign.to_dict()
+        self._notify()
+        return result
 
     def resume(self, campaign_id: str) -> dict:
         with self._lock:
@@ -338,6 +367,7 @@ class FirmwareOrchestrator:
                 campaign.status = CampaignStatus.RUNNING
                 campaign.updated_at = self._clock()
                 self._persist()
+        self._notify()
         return self.run_until_blocked(campaign_id)
 
     def cancel(self, campaign_id: str) -> dict:
@@ -351,7 +381,9 @@ class FirmwareOrchestrator:
                     campaign.device_states[dev] = DeviceUpdateState.SKIPPED
             campaign.updated_at = self._clock()
             self._persist()
-            return campaign.to_dict()
+            result = campaign.to_dict()
+        self._notify()
+        return result
 
     def status(self, campaign_id: str) -> dict:
         with self._lock:

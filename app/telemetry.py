@@ -50,10 +50,11 @@ class IngestResult:
 class TelemetryStore:
     def __init__(self, per_device_quota: int = 1000,
                  max_clock_skew_seconds: float = 300.0,
-                 clock=time.time):
+                 clock=time.time, on_change=None):
         self._quota = per_device_quota
         self._max_skew = max_clock_skew_seconds
         self._clock = clock
+        self._on_change = on_change
         self._shadows: dict[str, dict[str, object]] = {}
         self._versions: dict[str, dict[str, FieldVersion]] = {}
         self._seen_ids: dict[str, set[str]] = {}
@@ -89,44 +90,66 @@ class TelemetryStore:
     # -- public API ------------------------------------------------------
     def ingest(self, device_id: str, message_id: str, seq: int,
                device_ts: float, payload: dict) -> IngestResult:
+        import copy
+        changed = False
         with self._lock:
+            snapshot = (copy.deepcopy(self._shadows),
+                        copy.deepcopy(self._versions),
+                        copy.deepcopy(self._seen_ids),
+                        copy.deepcopy(self._accepted_count),
+                        copy.deepcopy(self._rejected))
             invalid = self._validate(device_id, message_id, seq, device_ts, payload)
             if invalid is not None:
-                return invalid
-
-            seen = self._seen_ids.setdefault(device_id, set())
-            if message_id in seen:
-                # Idempotent replay: success, no state change, no quota spent.
-                return IngestResult(accepted=True,
-                                    code=ErrorCode.DUPLICATE_MESSAGE.value)
-
-            count = self._accepted_count.get(device_id, 0)
-            if count >= self._quota:
-                return self._reject(device_id, ErrorCode.QUOTA_EXCEEDED)
-
-            seen.add(message_id)
-            self._accepted_count[device_id] = count + 1
-
-            shadow = self._shadows.setdefault(device_id, {})
-            versions = self._versions.setdefault(device_id, {})
-            incoming = FieldVersion(device_ts=device_ts, seq=seq)
-            decisions: list[MergeDecision] = []
-            for key, value in payload.items():
-                stored = versions.get(key)
-                if stored is None or incoming.as_tuple() > stored.as_tuple():
-                    shadow[key] = value
-                    versions[key] = incoming
-                    decisions.append(MergeDecision(
-                        field=key, outcome="applied",
-                        reason=(f"incoming (ts={device_ts}, seq={seq}) > stored "
-                                f"{stored.as_tuple() if stored else None}")))
+                result = invalid
+                changed = True  # rejected records are durable state too
+            else:
+                seen = self._seen_ids.setdefault(device_id, set())
+                if message_id in seen:
+                    # Idempotent replay: success, no state change, no quota spent.
+                    result = IngestResult(accepted=True,
+                                          code=ErrorCode.DUPLICATE_MESSAGE.value)
                 else:
-                    decisions.append(MergeDecision(
-                        field=key, outcome="stale_rejected",
-                        reason=(f"incoming (ts={device_ts}, seq={seq}) <= stored "
-                                f"{stored.as_tuple()}; kept "
-                                f"{shadow[key]!r}")))
-            return IngestResult(accepted=True, code="ok", decisions=decisions)
+                    count = self._accepted_count.get(device_id, 0)
+                    if count >= self._quota:
+                        result = self._reject(device_id, ErrorCode.QUOTA_EXCEEDED)
+                        changed = True
+                    else:
+                        seen.add(message_id)
+                        self._accepted_count[device_id] = count + 1
+
+                        shadow = self._shadows.setdefault(device_id, {})
+                        versions = self._versions.setdefault(device_id, {})
+                        incoming = FieldVersion(device_ts=device_ts, seq=seq)
+                        decisions: list[MergeDecision] = []
+                        for key, value in payload.items():
+                            stored = versions.get(key)
+                            if stored is None or incoming.as_tuple() > stored.as_tuple():
+                                shadow[key] = value
+                                versions[key] = incoming
+                                decisions.append(MergeDecision(
+                                    field=key, outcome="applied",
+                                    reason=(f"incoming (ts={device_ts}, seq={seq}) > stored "
+                                            f"{stored.as_tuple() if stored else None}")))
+                            else:
+                                decisions.append(MergeDecision(
+                                    field=key, outcome="stale_rejected",
+                                    reason=(f"incoming (ts={device_ts}, seq={seq}) <= stored "
+                                            f"{stored.as_tuple()}; kept "
+                                            f"{shadow[key]!r}")))
+                        result = IngestResult(accepted=True, code="ok",
+                                              decisions=decisions)
+                        changed = True
+        if changed and self._on_change is not None:
+            try:
+                self._on_change()
+            except Exception:
+                # durability refused (e.g. faulted store): undo the ingest so
+                # memory can never diverge from what survived on disk
+                with self._lock:
+                    (self._shadows, self._versions, self._seen_ids,
+                     self._accepted_count, self._rejected) = snapshot
+                raise
+        return result
 
     def shadow(self, device_id: str) -> dict:
         with self._lock:

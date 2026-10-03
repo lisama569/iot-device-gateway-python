@@ -53,6 +53,10 @@ class BackupManager:
         self._orchestrator = orchestrator
         self._flasher = flasher
         self._clock = clock
+        # Set by main wiring (DurableState); absent in plain unit usage.
+        self._durable = None
+        import threading
+        self._restore_lock = threading.Lock()
 
     # -- locking ---------------------------------------------------------
     @contextlib.contextmanager
@@ -327,18 +331,51 @@ class BackupManager:
         with self._all_locked():
             return self._is_empty_locked()
 
+    def install_snapshot_bytes(self, raw: bytes) -> dict:
+        """Validate a durable/backup snapshot and install it wholesale.
+
+        Used both by restore (after the non-empty/overwrite gate) and by
+        startup recovery (where an empty gateway is guaranteed). The
+        package is first fully staged and validated; only then is it made
+        durable (atomically replacing the state file) and swapped into
+        live memory. A failure at any point leaves the previously running
+        state completely untouched.
+        """
+        _manifest, payload = self._read_package(raw)
+        staged = self._stage(payload)
+        with self._restore_lock:
+            if self._durable is not None:
+                # disk first: if this cannot be written, live state is
+                # never overwritten with something that cannot survive a
+                # restart
+                self._durable.commit_package(raw)
+            with self._all_locked():
+                self._swap_locked(staged)
+            # re-export normalized state so every restart converges; also
+            # refreshes the predecessor copy
+            if self._durable is not None:
+                self._durable.flush_urgent()
+        return staged["summary"]
+
     def restore_bytes(self, raw: bytes, *,
                       allow_overwrite: bool = False) -> dict:
         _manifest, payload = self._read_package(raw)
         staged = self._stage(payload)
-        with self._all_locked():
-            if not allow_overwrite and not self._is_empty_locked():
-                raise BackupError(
-                    BackupRejection.NONEMPTY_TARGET,
-                    "refusing to restore into a gateway that already holds "
-                    "state; start from a clean data directory or pass "
-                    "allow_overwrite=True")
-            self._swap_locked(staged)
+        with self._restore_lock:
+            with self._all_locked():
+                if not allow_overwrite and not self._is_empty_locked():
+                    raise BackupError(
+                        BackupRejection.NONEMPTY_TARGET,
+                        "refusing to restore into a gateway that already holds "
+                        "state; start from a clean data directory or pass "
+                        "allow_overwrite=True")
+                if self._durable is not None:
+                    # durable file replaced before live memory; see
+                    # install_snapshot_bytes for why this order is safe
+                    self._durable.commit_package(raw)
+                self._swap_locked(staged)
+            if self._durable is not None:
+                self._durable.flush_urgent()
         return staged["summary"]
 
     def restore_from_path(self, path: str, *,

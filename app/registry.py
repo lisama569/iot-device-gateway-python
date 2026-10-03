@@ -41,21 +41,44 @@ class DeviceRegistry:
     """
 
     def __init__(self, credential_ttl_seconds: float | None = None,
-                 clock=time.time):
+                 clock=time.time, on_change=None):
         self._ttl = credential_ttl_seconds
         self._clock = clock
+        self._on_change = on_change
         self._devices: dict[str, Device] = {}
         self._lock = threading.Lock()
+
+    def _commit(self, mutate):
+        """Run `mutate` under the registry lock, then notify durability.
+
+        If the durability hook fails (e.g. the state store is faulted),
+        the in-memory mutation is rolled back so the gateway never keeps
+        a change it could not make durable: callers either get the whole
+        committed change or nothing.
+        """
+        import copy
+        with self._lock:
+            snapshot = copy.deepcopy(self._devices)
+            device = mutate()
+        try:
+            if self._on_change is not None:
+                self._on_change()
+        except Exception:
+            with self._lock:
+                self._devices = snapshot
+            raise
+        return device
 
     def register(self, device_id: str, secret: str) -> Device:
         if not device_id or not secret:
             raise GatewayError(ErrorCode.VALIDATION_FAILED,
                                "device_id and secret must be non-empty")
-        with self._lock:
+
+        def mutate():
             existing = self._devices.get(device_id)
             if existing is not None and existing.status is not DeviceStatus.DEREGISTERED:
                 if existing.credential.secret_hash == _hash_secret(secret):
-                    return existing  # idempotent replay
+                    return existing, False  # idempotent replay
                 raise GatewayError(ErrorCode.DEVICE_ID_CONFLICT,
                                    f"device_id {device_id!r} already registered "
                                    "with different credential")
@@ -70,7 +93,10 @@ class DeviceRegistry:
                             firmware_version=(existing.firmware_version
                                               if existing else "0.0.0"))
             self._devices[device_id] = device
-            return device
+            return device, True
+
+        device, _changed = self._commit(mutate)
+        return device
 
     def authenticate(self, device_id: str, secret: str) -> Device:
         with self._lock:
@@ -101,35 +127,40 @@ class DeviceRegistry:
         return device
 
     def disable(self, device_id: str) -> Device:
-        with self._lock:
+        def mutate():
             device = self._require(device_id)
             device.status = DeviceStatus.DISABLED
             return device
+        return self._commit(mutate)
 
     def enable(self, device_id: str) -> Device:
-        with self._lock:
+        def mutate():
             device = self._require(device_id)
             device.status = DeviceStatus.ACTIVE
             return device
+        return self._commit(mutate)
 
     def deregister(self, device_id: str) -> Device:
-        with self._lock:
+        def mutate():
             device = self._require(device_id)
             device.status = DeviceStatus.DEREGISTERED
             device.credential.revoked = True
             return device
+        return self._commit(mutate)
 
     def revoke_credential(self, device_id: str) -> Device:
-        with self._lock:
+        def mutate():
             device = self._require(device_id)
             device.credential.revoked = True
             return device
+        return self._commit(mutate)
 
     def rotate_credential(self, device_id: str, new_secret: str) -> Device:
         if not new_secret:
             raise GatewayError(ErrorCode.VALIDATION_FAILED,
                                "new secret must be non-empty")
-        with self._lock:
+
+        def mutate():
             device = self._require(device_id)
             now = self._clock()
             device.credential = Credential(
@@ -138,6 +169,7 @@ class DeviceRegistry:
                 expires_at=None if self._ttl is None else now + self._ttl,
             )
             return device
+        return self._commit(mutate)
 
     def get(self, device_id: str) -> Device:
         with self._lock:

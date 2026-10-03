@@ -26,6 +26,8 @@ class ErrorCode(enum.Enum):
     TASK_NOT_FOUND = "task_not_found"
     TASK_STATE_CONFLICT = "task_state_conflict"
     DEVICE_BUSY = "device_busy"
+    STATE_UNAVAILABLE = "state_unavailable"             # durable state unreadable at startup
+    STATE_PERSIST_FAILED = "state_persist_failed"       # durable snapshot could not be written
 
 
 class GatewayError(Exception):
